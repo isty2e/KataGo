@@ -1,20 +1,18 @@
-#include "core/global.h"
-#include "core/datetime.h"
-#include "core/makedir.h"
-#include "core/config_parser.h"
-#include "core/timer.h"
-#include "core/threadsafequeue.h"
-#include "dataio/sgf.h"
-#include "dataio/trainingwrite.h"
-#include "dataio/loadmodel.h"
-#include "neuralnet/modelversion.h"
-#include "search/asyncbot.h"
-#include "program/setup.h"
-#include "program/play.h"
-#include "main.h"
-
-#define TCLAP_NAMESTARTSTRING "-" //Use single dashes for all flags
-#include <tclap/CmdLine.h>
+#include "../core/global.h"
+#include "../core/datetime.h"
+#include "../core/makedir.h"
+#include "../core/config_parser.h"
+#include "../core/timer.h"
+#include "../core/threadsafequeue.h"
+#include "../dataio/sgf.h"
+#include "../dataio/trainingwrite.h"
+#include "../dataio/loadmodel.h"
+#include "../neuralnet/modelversion.h"
+#include "../search/asyncbot.h"
+#include "../program/setup.h"
+#include "../program/play.h"
+#include "../command/commandline.h"
+#include "../main.h"
 
 #include <chrono>
 #include <csignal>
@@ -112,7 +110,7 @@ namespace {
 
         if(sgfOut != NULL) {
           assert(data->startHist.moveHistory.size() <= data->endHist.moveHistory.size());
-          WriteSgf::writeSgf(*sgfOut,data->bName,data->wName,data->endHist,data);
+          WriteSgf::writeSgf(*sgfOut,data->bName,data->wName,data->endHist,data,false);
           (*sgfOut) << endl;
         }
         delete data;
@@ -163,19 +161,19 @@ int MainCmds::selfplay(int argc, const char* const* argv) {
   ScoreValue::initTables();
   Rand seedRand;
 
-  string configFile;
+  ConfigParser cfg;
   string modelsDir;
   string outputDir;
   try {
-    TCLAP::CmdLine cmd("Generate training data via self play", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> configFileArg("","config-file","Config file to use",true,string(),"FILE");
+    KataGoCommandLine cmd("Generate training data via self play.");
+    cmd.addConfigFileArg("","");
+
     TCLAP::ValueArg<string> modelsDirArg("","models-dir","Dir to poll and load models from",true,string(),"DIR");
     TCLAP::ValueArg<string> outputDirArg("","output-dir","Dir to output files",true,string(),"DIR");
-    cmd.add(configFileArg);
     cmd.add(modelsDirArg);
     cmd.add(outputDirArg);
     cmd.parse(argc,argv);
-    configFile = configFileArg.getValue();
+
     modelsDir = modelsDirArg.getValue();
     outputDir = outputDirArg.getValue();
 
@@ -185,12 +183,13 @@ int MainCmds::selfplay(int argc, const char* const* argv) {
     };
     checkDirNonEmpty("models-dir",modelsDir);
     checkDirNonEmpty("output-dir",outputDir);
+
+    cmd.getConfig(cfg);
   }
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
   }
-  ConfigParser cfg(configFile);
 
   MakeDir::make(outputDir);
   MakeDir::make(modelsDir);
@@ -206,7 +205,7 @@ int MainCmds::selfplay(int argc, const char* const* argv) {
 
   //Load runner settings
   const int numGameThreads = cfg.getInt("numGameThreads",1,16384);
-  const string searchRandSeedBase = Global::uint64ToHexString(seedRand.nextUInt64());
+  const string gameSeedBase = Global::uint64ToHexString(seedRand.nextUInt64());
 
   //Width and height of the board to use when writing data, typically 19
   const int dataBoardLen = cfg.getInt("dataBoardLen",9,37);
@@ -225,39 +224,8 @@ int MainCmds::selfplay(int argc, const char* const* argv) {
   const bool switchNetsMidGame = cfg.getBool("switchNetsMidGame");
 
   //Initialize object for randomizing game settings and running games
-  FancyModes fancyModes;
-  fancyModes.initGamesWithPolicy = cfg.getBool("initGamesWithPolicy");
-  fancyModes.forkSidePositionProb = cfg.getDouble("forkSidePositionProb",0.0,1.0);
-
-  fancyModes.compensateKomiVisits = cfg.contains("compensateKomiVisits") ? cfg.getInt("compensateKomiVisits",1,10000) : 20;
-  fancyModes.estimateLeadVisits = cfg.contains("estimateLeadVisits") ? cfg.getInt("estimateLeadVisits",1,10000) : 6;
-  fancyModes.estimateLeadProb = cfg.contains("estimateLeadProb") ? cfg.getDouble("estimateLeadProb",0.0,1.0) : 0.0;
-  fancyModes.fancyKomiVarying = cfg.contains("fancyKomiVarying") ? cfg.getBool("fancyKomiVarying") : false;
-
-  fancyModes.earlyForkGameProb = cfg.getDouble("earlyForkGameProb",0.0,0.5);
-  fancyModes.earlyForkGameExpectedMoveProp = cfg.getDouble("earlyForkGameExpectedMoveProp",0.0,1.0);
-  fancyModes.forkGameProb = cfg.getDouble("forkGameProb",0,0.5);
-  fancyModes.forkGameMinChoices = cfg.getInt("forkGameMinChoices",1,100);
-  fancyModes.earlyForkGameMaxChoices = cfg.getInt("earlyForkGameMaxChoices",1,100);
-  fancyModes.forkGameMaxChoices = cfg.getInt("forkGameMaxChoices",1,100);
-  fancyModes.cheapSearchProb = cfg.getDouble("cheapSearchProb",0.0,1.0);
-  fancyModes.cheapSearchVisits = cfg.getInt("cheapSearchVisits",1,10000000);
-  fancyModes.cheapSearchTargetWeight = cfg.getFloat("cheapSearchTargetWeight",0.0f,1.0f);
-  fancyModes.reduceVisits = cfg.getBool("reduceVisits");
-  fancyModes.reduceVisitsThreshold = cfg.getDouble("reduceVisitsThreshold",0.0,0.999999);
-  fancyModes.reduceVisitsThresholdLookback = cfg.getInt("reduceVisitsThresholdLookback",0,1000);
-  fancyModes.reducedVisitsMin = cfg.getInt("reducedVisitsMin",1,10000000);
-  fancyModes.reducedVisitsWeight = cfg.getFloat("reducedVisitsWeight",0.0f,1.0f);
-  fancyModes.policySurpriseDataWeight = cfg.getDouble("policySurpriseDataWeight",0.0f,1.0f);
-  fancyModes.handicapAsymmetricPlayoutProb = cfg.getDouble("handicapAsymmetricPlayoutProb",0.0,1.0);
-  fancyModes.normalAsymmetricPlayoutProb = cfg.getDouble("normalAsymmetricPlayoutProb",0.0,1.0);
-  fancyModes.maxAsymmetricRatio = cfg.getDouble("maxAsymmetricRatio",1.0,100.0);
-  fancyModes.minAsymmetricCompensateKomiProb = cfg.getDouble("minAsymmetricCompensateKomiProb",0.0,1.0);
-  fancyModes.sekiForkHack = true;
-  fancyModes.forSelfPlay = true;
-  fancyModes.dataXLen = dataBoardLen;
-  fancyModes.dataYLen = dataBoardLen;
-  GameRunner* gameRunner = new GameRunner(cfg, searchRandSeedBase, fancyModes, logger);
+  PlaySettings playSettings = PlaySettings::loadForSelfplay(cfg);
+  GameRunner* gameRunner = new GameRunner(cfg, playSettings, logger);
 
   Setup::initializeSession(cfg);
 
@@ -430,13 +398,14 @@ int MainCmds::selfplay(int argc, const char* const* argv) {
     &logger,
     &netAndStuffsMutex,&netAndStuffs,
     switchNetsMidGame,
-    &fancyModes,
-    &forkData
+    &forkData,
+    &gameSeedBase
   ](int threadIdx) {
     vector<std::atomic<bool>*> stopConditions = {&shouldStop};
 
     std::unique_lock<std::mutex> lock(netAndStuffsMutex);
     string prevModelName;
+    Rand thisLoopSeedRand;
     while(true) {
       if(shouldStop.load())
         break;
@@ -475,12 +444,12 @@ int MainCmds::selfplay(int argc, const char* const* argv) {
 
       FinishedGameData* gameData = NULL;
 
-      int64_t gameIdx;
       MatchPairer::BotSpec botSpecB;
       MatchPairer::BotSpec botSpecW;
-      if(netAndStuff->matchPairer->getMatchup(gameIdx, botSpecB, botSpecW, logger)) {
+      if(netAndStuff->matchPairer->getMatchup(botSpecB, botSpecW, logger)) {
+        string seed = gameSeedBase + ":" + Global::uint64ToHexString(thisLoopSeedRand.nextUInt64());
         gameData = gameRunner->runGame(
-          gameIdx, botSpecB, botSpecW, forkData, logger,
+          seed, botSpecB, botSpecW, forkData, logger,
           stopConditions,
           (switchNetsMidGame ? &checkForNewNNEval : NULL)
         );

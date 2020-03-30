@@ -15,7 +15,7 @@ logToStderr = false
 
 # Configure the maximum length of analysis printed out by lz-analyze and other places.
 # Controls the number of moves after the first move in a variation.
-# analysisPVLen = 9
+# analysisPVLen = 13
 
 # Report winrates for chat and analysis as (BLACK|WHITE|SIDETOMOVE).
 # Default is SIDETOMOVE, which is what tools that use LZ probably also expect
@@ -45,7 +45,7 @@ $$WHITE_HANDICAP_BONUS
 # Resignation occurs if for at least resignConsecTurns in a row,
 # the winLossUtility (which is on a [-1,1] scale) is below resignThreshold.
 allowResignation = true
-resignThreshold = -0.98
+resignThreshold = -0.90
 resignConsecTurns = 3
 
 # Handicap -------------
@@ -64,6 +64,12 @@ dynamicPlayoutDoublingAdvantageCapPerOppLead = 0.04
 
 # Controls which side dynamicPlayoutDoublingAdvantageCapPerOppLead or playoutDoublingAdvantage applies to.
 playoutDoublingAdvantagePla = WHITE
+
+# Misc Behavior --------------------
+
+# Uncomment and set to true to make KataGo avoid a particular joseki that some KataGo nets misevaluate,
+# and also to improve opening diversity versus some particular other bots that like to play it all the time.
+# avoidMYTDaggerHack = false
 
 # Search limits-----------------------------------------------------------------------------------
 

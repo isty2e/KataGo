@@ -1,15 +1,13 @@
-#include "core/global.h"
-#include "core/config_parser.h"
-#include "core/timer.h"
-#include "dataio/sgf.h"
-#include "search/asyncbot.h"
-#include "program/setup.h"
-#include "program/playutils.h"
-#include "program/play.h"
-#include "main.h"
-
-#define TCLAP_NAMESTARTSTRING "-" //Use single dashes for all flags
-#include <tclap/CmdLine.h>
+#include "../core/global.h"
+#include "../core/config_parser.h"
+#include "../core/timer.h"
+#include "../dataio/sgf.h"
+#include "../search/asyncbot.h"
+#include "../program/setup.h"
+#include "../program/playutils.h"
+#include "../program/play.h"
+#include "../command/commandline.h"
+#include "../main.h"
 
 using namespace std;
 
@@ -60,6 +58,7 @@ static const vector<string> knownCommands = {
   "final_status_list",
 
   "loadsgf",
+  "printsgf",
 
   //GTP extensions for board analysis
   // "genmove_analyze",
@@ -144,7 +143,7 @@ static bool noWhiteStonesOnBoard(const Board& board) {
 }
 
 static void updatePlayoutDoublingAdvantageHelper(
-  AsyncBot* bot, const Board& board, const BoardHistory& hist, Player pla,
+  AsyncBot* bot, const Board& board, const BoardHistory& hist,
   const double dynamicPlayoutDoublingAdvantageCapPerOppLead,
   const double staticPlayoutDoublingAdvantage,
   const vector<double>& recentWinLossValues,
@@ -156,9 +155,12 @@ static void updatePlayoutDoublingAdvantageHelper(
     desiredPlayoutDoublingAdvantage = staticPlayoutDoublingAdvantage;
   }
   else {
-    double pdaScalingStartPoints = 7.0;
+    double boardSizeScaling = pow(19.0 * 19.0 / (double)(board.x_size * board.y_size), 0.75);
+    double pdaScalingStartPoints = std::max(7.0 / boardSizeScaling, 2.0);
     double initialBlackAdvantageInPoints = initialBlackAdvantage(hist);
-    if(initialBlackAdvantageInPoints < pdaScalingStartPoints || pla != params.playoutDoublingAdvantagePla) {
+    Player disadvantagedPla = initialBlackAdvantageInPoints >= 0 ? P_WHITE : P_BLACK;
+    double initialAdvantageInPoints = abs(initialBlackAdvantageInPoints);
+    if(initialAdvantageInPoints < pdaScalingStartPoints || board.x_size <= 7 || board.y_size <= 7) {
       desiredPlayoutDoublingAdvantage = 0.0;
     }
     else {
@@ -166,12 +168,12 @@ static void updatePlayoutDoublingAdvantageHelper(
       //Power of 2 to avoid any rounding issues.
       const double increment = 0.125;
 
-      //Hard cap of 2.5 in this parameter, since more extreme values start to reach into values without good training.
+      //Hard cap of 2.75 in this parameter, since more extreme values start to reach into values without good training.
       //Scale mildly with board size - small board a given point lead counts as "more".
       double pdaCap = std::min(
         2.75,
         dynamicPlayoutDoublingAdvantageCapPerOppLead *
-        (initialBlackAdvantageInPoints - pdaScalingStartPoints) * pow(19.0 * 19.0 / (double)(board.x_size * board.y_size), 0.25)
+        (initialAdvantageInPoints - pdaScalingStartPoints) * boardSizeScaling
       );
       pdaCap = round(pdaCap / increment) * increment;
 
@@ -182,7 +184,8 @@ static void updatePlayoutDoublingAdvantageHelper(
       }
       else {
         double winLossValue = recentWinLossValues[recentWinLossValues.size()-1];
-        if(pla == P_BLACK)
+        //Convert to perspective of disadvantagedPla
+        if(disadvantagedPla == P_BLACK)
           winLossValue = -winLossValue;
 
         //Keep winLossValue between 5% and 25%, subject to available caps.
@@ -194,6 +197,9 @@ static void updatePlayoutDoublingAdvantageHelper(
         desiredPlayoutDoublingAdvantage = std::max(desiredPlayoutDoublingAdvantage, 0.0);
         desiredPlayoutDoublingAdvantage = std::min(desiredPlayoutDoublingAdvantage, pdaCap);
       }
+
+      if(params.playoutDoublingAdvantagePla == getOpp(disadvantagedPla))
+        desiredPlayoutDoublingAdvantage = -desiredPlayoutDoublingAdvantage;
     }
   }
 
@@ -270,7 +276,9 @@ static void printGenmoveLog(ostream& out, const AsyncBot* bot, const NNEvaluator
   out << "NN batches: " << nnEval->numBatchesProcessed() << endl;
   out << "NN avg batch size: " << nnEval->averageProcessedBatchSize() << endl;
   if(search->searchParams.playoutDoublingAdvantage != 0)
-    out << "PlayoutDoublingAdvantage: " << search->searchParams.playoutDoublingAdvantage << endl;
+    out << "PlayoutDoublingAdvantage: " << (
+      search->getRootPla() == getOpp(search->searchParams.playoutDoublingAdvantagePla) ?
+      -search->searchParams.playoutDoublingAdvantage : search->searchParams.playoutDoublingAdvantage) << endl;
   out << "PV: ";
   search->printPV(out, search->rootNode, 25);
   out << "\n";
@@ -306,13 +314,14 @@ struct GTPEngine {
   vector<double> recentWinLossValues;
   double lastSearchFactor;
   double desiredPlayoutDoublingAdvantage;
+  bool avoidMYTDaggerHack;
 
   Player perspective;
 
   GTPEngine(
     const string& modelFile, SearchParams initialParams, Rules initialRules,
     bool assumeMultiBlackHandicap, bool prevtEncore,
-    double dynamicPDACapPerOppLead, double staticPDA,
+    double dynamicPDACapPerOppLead, double staticPDA, bool avoidDagger,
     Player persp, int pvLen
   )
     :nnModelFile(modelFile),
@@ -333,6 +342,7 @@ struct GTPEngine {
      recentWinLossValues(),
      lastSearchFactor(1.0),
      desiredPlayoutDoublingAdvantage(staticPDA),
+     avoidMYTDaggerHack(avoidDagger),
      perspective(persp)
   {
   }
@@ -365,7 +375,6 @@ struct GTPEngine {
       logger.write("Cleaned up old neural net and bot");
     }
 
-    //Initial setup
     bool wasDefault = false;
     if(boardXSize == -1 || boardYSize == -1) {
       boardXSize = 19;
@@ -392,7 +401,7 @@ struct GTPEngine {
       }
     }
 
-    //On initial setup, size the board to whatever the neural net was initialized with
+    //On default setup, also override board size to whatever the neural net was initialized with
     //So that if the net was initalized smaller, we don't fail with a big board
     if(wasDefault) {
       boardXSize = nnEval->getNNXLen();
@@ -425,8 +434,7 @@ struct GTPEngine {
     initialPla = newInitialPla;
     moveHistory = newMoveHistory;
     recentWinLossValues.clear();
-    //Update it assuming the bot will be playing as params.playoutDoublingAdvantagePla
-    updatePlayoutDoublingAdvantage(params.playoutDoublingAdvantagePla);
+    updatePlayoutDoublingAdvantage();
   }
 
   void clearBoard() {
@@ -449,10 +457,9 @@ struct GTPEngine {
     staticPlayoutDoublingAdvantage = d;
   }
 
-  //Update playout doubling advantage for the engine for playing as pla
-  void updatePlayoutDoublingAdvantage(Player pla) {
+  void updatePlayoutDoublingAdvantage() {
     updatePlayoutDoublingAdvantageHelper(
-      bot,bot->getRootBoard(),bot->getRootHist(),pla,
+      bot,bot->getRootBoard(),bot->getRootHist(),
       dynamicPlayoutDoublingAdvantageCapPerOppLead,
       staticPlayoutDoublingAdvantage,
       recentWinLossValues,
@@ -541,36 +548,8 @@ struct GTPEngine {
 
   std::function<void(const Search* search)> getAnalyzeCallback(Player pla, AnalyzeArgs args) {
     std::function<void(const Search* search)> callback;
-    //analyze
-    if(!args.kata && !args.lz) {
-      callback = [args,pla,this](const Search* search) {
-        vector<AnalysisData> buf;
-        search->getAnalysisData(buf,args.minMoves,false,analysisPVLen);
-        if(buf.size() > args.maxMoves)
-          buf.resize(args.maxMoves);
-        if(buf.size() <= 0)
-          return;
-
-        const Board board = search->getRootBoard();
-        for(int i = 0; i<buf.size(); i++) {
-          if(i > 0)
-            cout << " ";
-          const AnalysisData& data = buf[i];
-          double winrate = 0.5 * (1.0 + data.winLossValue);
-          if(perspective == P_BLACK || (perspective != P_BLACK && perspective != P_WHITE && pla == P_BLACK)) {
-            winrate = 1.0-winrate;
-          }
-          cout << "info";
-          cout << " move " << Location::toString(data.move,board);
-          cout << " visits " << data.numVisits;
-          cout << " winrate " << round(winrate * 10000.0);
-          cout << " order " << data.order;
-        }
-        cout << endl;
-      };
-    }
     //lz-analyze
-    else if(!args.kata) {
+    if(args.lz && !args.kata) {
       callback = [args,pla,this](const Search* search) {
         vector<AnalysisData> buf;
         search->getAnalysisData(buf,args.minMoves,false,analysisPVLen);
@@ -606,7 +585,7 @@ struct GTPEngine {
         cout << endl;
       };
     }
-    //kata-analyze
+    //kata-analyze, analyze (sabaki)
     else {
       callback = [args,pla,this](const Search* search) {
         vector<AnalysisData> buf;
@@ -622,10 +601,17 @@ struct GTPEngine {
           ownership = search->getAverageTreeOwnership(ownershipMinVisits);
         }
 
+        ostringstream out;
+        if(!args.kata) {
+          //Hack for sabaki - ensure always showing decimal point. Also causes output to be more verbose with trailing zeros,
+          //unfortunately, despite doing not improving the precision of the values.
+          out << std::showpoint;
+        }
+
         const Board board = search->getRootBoard();
         for(int i = 0; i<buf.size(); i++) {
           if(i > 0)
-            cout << " ";
+            out << " ";
           const AnalysisData& data = buf[i];
           double winrate = 0.5 * (1.0 + data.winLossValue);
           double utility = data.utility;
@@ -643,43 +629,43 @@ struct GTPEngine {
             lead = -lead;
             utilityLcb = -utilityLcb;
           }
-          cout << "info";
-          cout << " move " << Location::toString(data.move,board);
-          cout << " visits " << data.numVisits;
-          cout << " utility " << utility;
-          cout << " winrate " << winrate;
-          cout << " scoreMean " << lead;
-          cout << " scoreStdev " << data.scoreStdev;
-          cout << " scoreLead " << lead;
-          cout << " scoreSelfplay " << scoreMean;
-          cout << " prior " << data.policyPrior;
-          cout << " lcb " << lcb;
-          cout << " utilityLcb " << utilityLcb;
-          cout << " order " << data.order;
-          cout << " pv ";
+          out << "info";
+          out << " move " << Location::toString(data.move,board);
+          out << " visits " << data.numVisits;
+          out << " utility " << utility;
+          out << " winrate " << winrate;
+          out << " scoreMean " << lead;
+          out << " scoreStdev " << data.scoreStdev;
+          out << " scoreLead " << lead;
+          out << " scoreSelfplay " << scoreMean;
+          out << " prior " << data.policyPrior;
+          out << " lcb " << lcb;
+          out << " utilityLcb " << utilityLcb;
+          out << " order " << data.order;
+          out << " pv ";
           if(preventEncore && data.pvContainsPass())
-            data.writePVUpToPhaseEnd(cout,board,search->getRootHist(),search->getRootPla());
+            data.writePVUpToPhaseEnd(out,board,search->getRootHist(),search->getRootPla());
           else
-            data.writePV(cout,board);
+            data.writePV(out,board);
         }
 
         if(args.showOwnership) {
-          cout << " ";
+          out << " ";
 
-          cout << "ownership";
+          out << "ownership";
           int nnXLen = search->nnXLen;
           for(int y = 0; y<board.y_size; y++) {
             for(int x = 0; x<board.x_size; x++) {
               int pos = NNPos::xyToPos(x,y,nnXLen);
               if(perspective == P_BLACK || (perspective != P_BLACK && perspective != P_WHITE && pla == P_BLACK))
-                cout << " " << -ownership[pos];
+                out << " " << -ownership[pos];
               else
-                cout << " " << ownership[pos];
+                out << " " << ownership[pos];
             }
           }
         }
 
-        cout << endl;
+        cout << out.str() << endl;
       };
     }
     return callback;
@@ -703,11 +689,16 @@ struct GTPEngine {
     TimeControls tc = pla == P_BLACK ? bTimeControls : wTimeControls;
 
     //Update PDA given whatever the most recent values are
-    updatePlayoutDoublingAdvantage(pla);
-    //Make sure we have the right PDA parameters, in case someone ran analysis in the meantime.
+    updatePlayoutDoublingAdvantage();
+    //Make sure we have the right parameters, in case someone ran analysis in the meantime.
     if(dynamicPlayoutDoublingAdvantageCapPerOppLead != 0.0 &&
        params.playoutDoublingAdvantage != desiredPlayoutDoublingAdvantage) {
       params.playoutDoublingAdvantage = desiredPlayoutDoublingAdvantage;
+      bot->setParams(params);
+    }
+    Player avoidMYTDaggerHackPla = avoidMYTDaggerHack ? pla : C_EMPTY;
+    if(params.avoidMYTDaggerHackPla != avoidMYTDaggerHackPla) {
+      params.avoidMYTDaggerHackPla = avoidMYTDaggerHackPla;
       bot->setParams(params);
     }
 
@@ -883,7 +874,7 @@ struct GTPEngine {
     setPositionAndRules(pla,board,hist,board,pla,newMoveHistory);
   }
 
-  void placeFreeHandicap(int n, string& response, bool& responseIsError) {
+  void placeFreeHandicap(int n, string& response, bool& responseIsError, Rand& rand) {
     stopAndWait();
 
     //If asked to place more, we just go ahead and only place up to 30, or a quarter of the board
@@ -901,7 +892,6 @@ struct GTPEngine {
     Player pla = P_BLACK;
     BoardHistory hist(board,pla,currentRules,0);
     double extraBlackTemperature = 0.25;
-    Rand rand;
     PlayUtils::playExtraBlack(bot->getSearchStopAndWait(), n, board, hist, extraBlackTemperature, rand);
     //Also switch the initial player, expecting white should be next.
     hist.clear(board,P_WHITE,currentRules,0);
@@ -930,6 +920,10 @@ struct GTPEngine {
     //for users.
     if(params.playoutDoublingAdvantage != staticPlayoutDoublingAdvantage) {
       params.playoutDoublingAdvantage = staticPlayoutDoublingAdvantage;
+      bot->setParams(params);
+    }
+    if(params.avoidMYTDaggerHackPla != C_EMPTY) {
+      params.avoidMYTDaggerHackPla = C_EMPTY;
       bot->setParams(params);
     }
 
@@ -1180,37 +1174,27 @@ int MainCmds::gtp(int argc, const char* const* argv) {
   ScoreValue::initTables();
   Rand seedRand;
 
-  string configFile;
+  ConfigParser cfg;
   string nnModelFile;
   string overrideVersion;
-  string overrideConfig;
   try {
-    TCLAP::CmdLine cmd("Run GTP engine", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> configFileArg("","config","Config file to use (see configs/gtp_example.cfg)",true,string(),"FILE");
-    TCLAP::ValueArg<string> nnModelFileArg("","model","Neural net model file",true,string(),"FILE");
+    KataGoCommandLine cmd("Run KataGo main GTP engine for playing games or casual analysis.");
+    cmd.addConfigFileArg(KataGoCommandLine::defaultGtpConfigFileName(),"gtp_example.cfg");
+    cmd.addModelFileArg();
+    cmd.setShortUsageArgLimit();
+    cmd.addOverrideConfigArg();
+
     TCLAP::ValueArg<string> overrideVersionArg("","override-version","Force KataGo to say a certain value in response to gtp version command",false,string(),"VERSION");
-    TCLAP::ValueArg<string> overrideConfigArg("","override-config","Override config parameters. Format: \"key=value, key=value,...\"",false,string(),"KEYVALUEPAIRS");
-    cmd.add(configFileArg);
-    cmd.add(nnModelFileArg);
     cmd.add(overrideVersionArg);
-    cmd.add(overrideConfigArg);
     cmd.parse(argc,argv);
-    configFile = configFileArg.getValue();
-    nnModelFile = nnModelFileArg.getValue();
+    nnModelFile = cmd.getModelFile();
     overrideVersion = overrideVersionArg.getValue();
-    overrideConfig = overrideConfigArg.getValue();
+
+    cmd.getConfig(cfg);
   }
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
-  }
-
-  ConfigParser cfg(configFile);
-  if(overrideConfig != "") {
-    map<string,string> newkvs = ConfigParser::parseCommaSeparated(overrideConfig);
-    //HACK to avoid a common possible conflict - if we specify some of the rules options on one side, the other side should be erased.
-    vector<pair<set<string>,set<string>>> mutexKeySets = Setup::getMutexKeySets();
-    cfg.overrideKeys(newkvs,mutexKeySets);
   }
 
   Logger logger;
@@ -1261,7 +1245,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
   const double searchFactorWhenWinning = cfg.contains("searchFactorWhenWinning") ? cfg.getDouble("searchFactorWhenWinning",0.01,1.0) : 1.0;
   const double searchFactorWhenWinningThreshold = cfg.contains("searchFactorWhenWinningThreshold") ? cfg.getDouble("searchFactorWhenWinningThreshold",0.0,1.0) : 1.0;
   const bool ogsChatToStderr = cfg.contains("ogsChatToStderr") ? cfg.getBool("ogsChatToStderr") : false;
-  const int analysisPVLen = cfg.contains("analysisPVLen") ? cfg.getInt("analysisPVLen",1,100) : 9;
+  const int analysisPVLen = cfg.contains("analysisPVLen") ? cfg.getInt("analysisPVLen",1,1000) : 13;
   const bool assumeMultipleStartingBlackMovesAreHandicap =
     cfg.contains("assumeMultipleStartingBlackMovesAreHandicap") ? cfg.getBool("assumeMultipleStartingBlackMovesAreHandicap") : true;
   const bool preventEncore = cfg.contains("preventCleanupPhase") ? cfg.getBool("preventCleanupPhase") : true;
@@ -1270,6 +1254,21 @@ int MainCmds::gtp(int argc, const char* const* argv) {
   if(cfg.contains("dynamicPlayoutDoublingAdvantageCapPerOppLead") && initialParams.playoutDoublingAdvantagePla == C_EMPTY)
     throw StringError("When specifying dynamicPlayoutDoublingAdvantageCapPerOppLead, must specify a player for playoutDoublingAdvantagePla");
   double staticPlayoutDoublingAdvantage = initialParams.playoutDoublingAdvantage;
+  const bool avoidMYTDaggerHack = cfg.contains("avoidMYTDaggerHack") ? cfg.getBool("avoidMYTDaggerHack") : false;
+
+  const int defaultBoardXSize =
+    cfg.contains("defaultBoardXSize") ? cfg.getInt("defaultBoardXSize",2,Board::MAX_LEN) :
+    cfg.contains("defaultBoardSize") ? cfg.getInt("defaultBoardSize",2,Board::MAX_LEN) :
+    -1;
+  const int defaultBoardYSize =
+    cfg.contains("defaultBoardYSize") ? cfg.getInt("defaultBoardYSize",2,Board::MAX_LEN) :
+    cfg.contains("defaultBoardSize") ? cfg.getInt("defaultBoardSize",2,Board::MAX_LEN) :
+    -1;
+  const bool forDeterministicTesting =
+    cfg.contains("forDeterministicTesting") ? cfg.getBool("forDeterministicTesting") : false;
+
+  if(forDeterministicTesting)
+    seedRand.init("forDeterministicTesting");
 
   Player perspective = Setup::parseReportAnalysisWinrates(cfg,C_EMPTY);
 
@@ -1277,19 +1276,21 @@ int MainCmds::gtp(int argc, const char* const* argv) {
     nnModelFile,initialParams,initialRules,
     assumeMultipleStartingBlackMovesAreHandicap,preventEncore,
     dynamicPlayoutDoublingAdvantageCapPerOppLead,
-    staticPlayoutDoublingAdvantage,
+    staticPlayoutDoublingAdvantage,avoidMYTDaggerHack,
     perspective,analysisPVLen
   );
-  engine->setOrResetBoardSize(cfg,logger,seedRand,-1,-1);
+  engine->setOrResetBoardSize(cfg,logger,seedRand,defaultBoardXSize,defaultBoardYSize);
 
   //Check for unused config keys
   cfg.warnUnusedKeys(cerr,&logger);
 
+  logger.write("Loaded config " + cfg.getFileName());
   logger.write("Loaded model "+ nnModelFile);
   logger.write("Model name: "+ (engine->nnEval == NULL ? string() : engine->nnEval->getInternalModelName()));
   logger.write("GTP ready, beginning main protocol loop");
   //Also check loggingToStderr so that we don't duplicate the message from the log file
   if(startupPrintMessageToStderr && !loggingToStderr) {
+    cerr << "Loaded config " << cfg.getFileName() << endl;
     cerr << "Loaded model " << nnModelFile << endl;
     cerr << "Model name: "+ (engine->nnEval == NULL ? string() : engine->nnEval->getInternalModelName()) << endl;
     cerr << "GTP ready, beginning main protocol loop" << endl;
@@ -1964,7 +1965,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
         response = "Board is not empty";
       }
       else {
-        engine->placeFreeHandicap(n,response,responseIsError);
+        engine->placeFreeHandicap(n,response,responseIsError,seedRand);
       }
     }
 
@@ -2185,6 +2186,24 @@ int MainCmds::gtp(int argc, const char* const* argv) {
             engine->setPositionAndRules(sgfNextPla, sgfBoard, sgfHist, sgfInitialBoard, sgfInitialNextPla, sgfHist.moveHistory);
           }
         }
+      }
+    }
+
+    else if(command == "printsgf") {
+      if(pieces.size() != 0 && pieces.size() != 1) {
+        responseIsError = true;
+        response = "Expected zero or one argument for print but got '" + Global::concat(pieces," ") + "'";
+      }
+      else if(pieces.size() == 0 || pieces[0] == "-") {
+        ostringstream out;
+        WriteSgf::writeSgf(out,"","",engine->bot->getRootHist(),NULL,true);
+        response = out.str();
+      }
+      else {
+        ofstream out(pieces[0]);
+        WriteSgf::writeSgf(out,"","",engine->bot->getRootHist(),NULL,true);
+        out.close();
+        response = "";
       }
     }
 

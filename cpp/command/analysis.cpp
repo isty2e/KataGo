@@ -1,16 +1,14 @@
-#include "core/global.h"
-#include "core/config_parser.h"
-#include "core/timer.h"
-#include "search/asyncbot.h"
-#include "program/setup.h"
-#include "program/playutils.h"
-#include "program/play.h"
-#include "main.h"
+#include "../core/global.h"
+#include "../core/config_parser.h"
+#include "../core/timer.h"
+#include "../search/asyncbot.h"
+#include "../program/setup.h"
+#include "../program/playutils.h"
+#include "../program/play.h"
+#include "../command/commandline.h"
+#include "../main.h"
 
-#define TCLAP_NAMESTARTSTRING "-" //Use single dashes for all flags
-#include <tclap/CmdLine.h>
-
-#include "external/nlohmann_json/json.hpp"
+#include "../external/nlohmann_json/json.hpp"
 
 using namespace std;
 using json = nlohmann::json;
@@ -35,31 +33,32 @@ int MainCmds::analysis(int argc, const char* const* argv) {
   ScoreValue::initTables();
   Rand seedRand;
 
-  string configFile;
+  ConfigParser cfg;
   string modelFile;
   int numAnalysisThreads;
   try {
-    TCLAP::CmdLine cmd("Run parallel analysis engine", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> configFileArg("","config","Config file to use (see configs/gtp_example.cfg)",true,string(),"FILE");
-    TCLAP::ValueArg<string> modelFileArg("","model","Neural net model file",true,string(),"FILE");
+    KataGoCommandLine cmd("Run KataGo parallel JSON-based analysis engine.");
+    cmd.addConfigFileArg("","analysis_example.cfg");
+    cmd.addModelFileArg();
+    cmd.setShortUsageArgLimit();
+    cmd.addOverrideConfigArg();
+
     TCLAP::ValueArg<int> numAnalysisThreadsArg("","analysis-threads","Analysis up to this many positions in parallel",true,0,"THREADS");
-    cmd.add(configFileArg);
-    cmd.add(modelFileArg);
     cmd.add(numAnalysisThreadsArg);
     cmd.parse(argc,argv);
-    configFile = configFileArg.getValue();
-    modelFile = modelFileArg.getValue();
+
+    modelFile = cmd.getModelFile();
     numAnalysisThreads = numAnalysisThreadsArg.getValue();
 
     if(numAnalysisThreads <= 0 || numAnalysisThreads >= 16384)
-      throw new StringError("Invalid value for numAnalysisThreads");
+      throw StringError("Invalid value for numAnalysisThreads");
+
+    cmd.getConfig(cfg);
   }
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
   }
-
-  ConfigParser cfg(configFile);
 
   Logger logger;
   logger.addFile(cfg.getString("logFile"));
@@ -90,10 +89,12 @@ int MainCmds::analysis(int argc, const char* const* argv) {
       Setup::SETUP_FOR_ANALYSIS
     );
   }
-  logger.write("Loaded model "+ modelFile);
 
   //Check for unused config keys
   cfg.warnUnusedKeys(cerr,&logger);
+
+  logger.write("Loaded config "+ cfg.getFileName());
+  logger.write("Loaded model "+ modelFile);
 
   ThreadSafeQueue<string*> toWriteQueue;
   auto writeLoop = [&toWriteQueue]() {

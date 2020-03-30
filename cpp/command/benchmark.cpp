@@ -1,13 +1,14 @@
-#include "core/global.h"
-#include "core/config_parser.h"
-#include "core/timer.h"
-#include "dataio/sgf.h"
-#include "search/asyncbot.h"
-#include "program/setup.h"
-#include "program/playutils.h"
-#include "program/gtpconfig.h"
-#include "tests/tests.h"
-#include "main.h"
+#include "../core/global.h"
+#include "../core/config_parser.h"
+#include "../core/timer.h"
+#include "../dataio/sgf.h"
+#include "../search/asyncbot.h"
+#include "../program/setup.h"
+#include "../program/playutils.h"
+#include "../program/gtpconfig.h"
+#include "../tests/tests.h"
+#include "../command/commandline.h"
+#include "../main.h"
 
 #include <chrono>
 #include <map>
@@ -16,9 +17,6 @@
 
 #include <boost/filesystem.hpp>
 namespace bfs = boost::filesystem;
-
-#define TCLAP_NAMESTARTSTRING "-" //Use single dashes for all flags
-#include <tclap/CmdLine.h>
 
 using namespace std;
 
@@ -54,87 +52,87 @@ int MainCmds::benchmark(int argc, const char* const* argv) {
 
   static const string defaultThreadsToTest = "1,2,4,6,8,12,16,24";
 
-  string configFile;
+  ConfigParser cfg;
   string modelFile;
   string sgfFile;
   int boardSize;
   int64_t maxVisits;
-  string desiredThreadsStr;
+  vector<int> numThreadsToTest;
   int numPositionsPerGame;
   bool autoTuneThreads;
   int secondsPerGameMove;
   try {
-    TCLAP::CmdLine cmd("Benchmark to test speed with different numbers of threads", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> configFileArg("","config","Config file to use, same as for gtp (see gtp_example.cfg)",true,string(),"FILE");
-    TCLAP::ValueArg<string> modelFileArg("","model","Neural net model file to use",true,string(),"FILE");
-    TCLAP::ValueArg<string> sgfFileArg("","sgf", "Optional game to sample positions from (default: uses a built-in-set of positions)",false,string(),"FILE");
-    TCLAP::ValueArg<int> boardSizeArg("","boardsize", "Size of board to benchmark on (9-19), default 19",false,-1,"SIZE");
+    KataGoCommandLine cmd("Benchmark with gtp config to test speed with different numbers of threads.");
+    cmd.addConfigFileArg(KataGoCommandLine::defaultGtpConfigFileName(),"gtp_example.cfg");
+    cmd.addModelFileArg();
     TCLAP::ValueArg<long> visitsArg("v","visits","How many visits to use per search (default " + Global::int64ToString(defaultMaxVisits) + ")",false,(long)defaultMaxVisits,"VISITS");
     TCLAP::ValueArg<string> threadsArg("t","threads","Test these many threads, comma-separated (default " + defaultThreadsToTest + ")",false,defaultThreadsToTest,"THREADS");
     TCLAP::ValueArg<int> numPositionsPerGameArg("n","numpositions","How many positions to sample from a game (default 10)",false,10,"NUM");
+    TCLAP::ValueArg<string> sgfFileArg("","sgf", "Optional game to sample positions from (default: uses a built-in-set of positions)",false,string(),"FILE");
+    TCLAP::ValueArg<int> boardSizeArg("","boardsize", "Size of board to benchmark on (9-19), default 19",false,-1,"SIZE");
     TCLAP::SwitchArg autoTuneThreadsArg("s","tune","Automatically search for the optimal number of threads");
     TCLAP::ValueArg<int> secondsPerGameMoveArg("i","time","Typical amount of time per move spent while playing, in seconds (default " +
                                                Global::doubleToString(defaultSecondsPerGameMove) + ")",false,defaultSecondsPerGameMove,"SECONDS");
-
-    cmd.add(configFileArg);
-    cmd.add(modelFileArg);
-    cmd.add(sgfFileArg);
-    cmd.add(boardSizeArg);
     cmd.add(visitsArg);
     cmd.add(threadsArg);
     cmd.add(numPositionsPerGameArg);
+
+    cmd.setShortUsageArgLimit();
+
+    cmd.addOverrideConfigArg();
+
+    cmd.add(sgfFileArg);
+    cmd.add(boardSizeArg);
     cmd.add(autoTuneThreadsArg);
     cmd.add(secondsPerGameMoveArg);
     cmd.parse(argc,argv);
 
-    configFile = configFileArg.getValue();
-    modelFile = modelFileArg.getValue();
+    modelFile = cmd.getModelFile();
     sgfFile = sgfFileArg.getValue();
     boardSize = boardSizeArg.getValue();
     maxVisits = (int64_t)visitsArg.getValue();
-    desiredThreadsStr = threadsArg.getValue();
+    string desiredThreadsStr = threadsArg.getValue();
     numPositionsPerGame = numPositionsPerGameArg.getValue();
     autoTuneThreads = autoTuneThreadsArg.getValue();
     secondsPerGameMove = secondsPerGameMoveArg.getValue();
+
+    if(boardSize != -1 && sgfFile != "")
+      throw StringError("Cannot specify both -sgf and -boardsize at the same time");
+    if(boardSize != -1 && (boardSize < 9 || boardSize > 19))
+      throw StringError("Board size to test: invalid value " + Global::intToString(boardSize));
+    if(maxVisits <= 1 || maxVisits >= 1000000000)
+      throw StringError("Number of visits to use: invalid value " + Global::int64ToString(maxVisits));
+    if(numPositionsPerGame <= 0 || numPositionsPerGame > 100000)
+      throw StringError("Number of positions per game to use: invalid value " + Global::intToString(numPositionsPerGame));
+    if(secondsPerGameMove <= 0 || secondsPerGameMove > 1000000)
+      throw StringError("Number of seconds per game move to assume: invalid value " + Global::doubleToString(secondsPerGameMove));
+    if(desiredThreadsStr != defaultThreadsToTest && autoTuneThreads)
+      throw StringError("Cannot both automatically tune threads and specify fixed exact numbers of threads to test");
+
+    if(!autoTuneThreads) {
+      vector<string> desiredThreadsPieces = Global::split(desiredThreadsStr,',');
+      for(int i = 0; i<desiredThreadsPieces.size(); i++) {
+        string s = Global::trim(desiredThreadsPieces[i]);
+        if(s == "")
+          continue;
+        int desiredThreads;
+        bool suc = Global::tryStringToInt(s,desiredThreads);
+        if(!suc || desiredThreads <= 0 || desiredThreads > 1024)
+          throw StringError("Number of threads to use: invalid value: " + s);
+        numThreadsToTest.push_back(desiredThreads);
+      }
+
+      if(numThreadsToTest.size() <= 0) {
+        throw StringError("Must specify at least one valid value for -threads");
+      }
+    }
+
+    cmd.getConfig(cfg);
   }
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
   }
-
-  if(boardSize != -1 && sgfFile != "")
-    throw StringError("Cannot specify both -sgf and -boardsize at the same time");
-  if(boardSize != -1 && (boardSize < 9 || boardSize > 19))
-    throw StringError("Board size to test: invalid value " + Global::intToString(boardSize));
-  if(maxVisits <= 1 || maxVisits >= 1000000000)
-    throw StringError("Number of visits to use: invalid value " + Global::int64ToString(maxVisits));
-  if(numPositionsPerGame <= 0 || numPositionsPerGame > 100000)
-    throw StringError("Number of positions per game to use: invalid value " + Global::intToString(numPositionsPerGame));
-  if(secondsPerGameMove <= 0 || secondsPerGameMove > 1000000)
-    throw StringError("Number of seconds per game move to assume: invalid value " + Global::doubleToString(secondsPerGameMove));
-  if(desiredThreadsStr != defaultThreadsToTest && autoTuneThreads)
-    throw StringError("Cannot both automatically tune threads and specify fixed exact numbers of threads to test");
-
-  vector<int> numThreadsToTest;
-  if(!autoTuneThreads) {
-    vector<string> desiredThreadsPieces = Global::split(desiredThreadsStr,',');
-    for(int i = 0; i<desiredThreadsPieces.size(); i++) {
-      string s = Global::trim(desiredThreadsPieces[i]);
-      if(s == "")
-        continue;
-      int desiredThreads;
-      bool suc = Global::tryStringToInt(s,desiredThreads);
-      if(!suc || desiredThreads <= 0 || desiredThreads > 1024)
-        throw StringError("Number of threads to use: invalid value: " + s);
-      numThreadsToTest.push_back(desiredThreads);
-    }
-
-    if(numThreadsToTest.size() <= 0) {
-      throw StringError("Must specify at least one valid value for -threads");
-    }
-  }
-
-  ConfigParser cfg(configFile);
 
   CompactSgf* sgf;
   if(sgfFile != "") {
@@ -181,6 +179,9 @@ int MainCmds::benchmark(int argc, const char* const* argv) {
   else
     reallocateNNEvalWithEnoughBatchSize(ternarySearchInitialMax);
 
+  logger.write("Loaded config " + cfg.getFileName());
+  logger.write("Loaded model "+ modelFile);
+
   cout << endl;
   cout << "Testing using " << maxVisits << " visits." << endl;
   if(maxVisits == defaultMaxVisits) {
@@ -216,14 +217,14 @@ int MainCmds::benchmark(int argc, const char* const* argv) {
   if(numThreadsToTest.size() > 1 || autoTuneThreads) {
     PlayUtils::BenchmarkResults::printEloComparison(results,secondsPerGameMove);
 
-    cout << "If you care about performance, you may want to edit numSearchThreads in " << configFile << " based on the above results!" << endl;
+    cout << "If you care about performance, you may want to edit numSearchThreads in " << cfg.getFileName() << " based on the above results!" << endl;
     if(cfg.contains("nnMaxBatchSize"))
       cout << "WARNING: Your nnMaxBatchSize is hardcoded to " + cfg.getString("nnMaxBatchSize") + ", recommend deleting it and using the default (which this benchmark assumes)" << endl;
 
     cout << "If you intend to do much longer searches, configure the seconds per game move you expect with the '-time' flag and benchmark again." << endl;
     cout << "If you intend to do short or fixed-visit searches, use lower numSearchThreads for better strength, high threads will weaken strength." << endl;
 
-    cout << "If interested see also other notes about performance and mem usage in the top of " << configFile << endl;
+    cout << "If interested see also other notes about performance and mem usage in the top of " << cfg.getFileName() << endl;
     cout << endl;
   }
 
@@ -436,17 +437,18 @@ int MainCmds::genconfig(int argc, const char* const* argv, const char* firstComm
 
   string outputFile;
   string modelFile;
+  bool modelFileIsDefault;
   try {
-    TCLAP::CmdLine cmd("Automatically generate and tune a new GTP config", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> outputFileArg("","output","Path to write new config (default gtp.cfg)",false,string("gtp.cfg"),"FILE");
-    TCLAP::ValueArg<string> modelFileArg("","model","Neural net model file to use",true,string(),"FILE");
+    KataGoCommandLine cmd("Automatically generate and tune a new GTP config.");
+    cmd.addModelFileArg();
 
+    TCLAP::ValueArg<string> outputFileArg("","output","Path to write new config (default gtp.cfg)",false,string("gtp.cfg"),"FILE");
     cmd.add(outputFileArg);
-    cmd.add(modelFileArg);
     cmd.parse(argc,argv);
 
     outputFile = outputFileArg.getValue();
-    modelFile = modelFileArg.getValue();
+    modelFile = cmd.getModelFile();
+    modelFileIsDefault = cmd.modelFileIsDefault();
   }
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
@@ -639,7 +641,7 @@ int MainCmds::genconfig(int argc, const char* const* argv, const char* firstComm
     cout << endl;
 
     string prompt =
-      "Specify devices/GPUs to use (for example \"0,1,2\" to use devices 0, 1, and 2). Leave blank for good default:\n";
+      "Specify devices/GPUs to use (for example \"0,1,2\" to use devices 0, 1, and 2). Leave blank for a default SINGLE-GPU config:\n";
     promptAndParseInput(prompt, [&](const string& line) {
         vector<string> pieces = Global::split(line,',');
         configDeviceIdxs.clear();
@@ -796,8 +798,8 @@ int MainCmds::genconfig(int argc, const char* const* argv, const char* firstComm
       reallocateNNEvalWithEnoughBatchSize(ternarySearchInitialMax);
       vector<PlayUtils::BenchmarkResults> results = doFixedTuneThreads(params,sgf,3,nnEval,logger,secondsPerGameMove,numThreads,false);
       double visitsPerSecond = results[0].totalVisits / (results[0].totalSeconds + 0.00001);
-      //Make tests use about 1 second each
-      maxVisits = (int64_t)round(visitsPerSecond/100.0) * 100;
+      //Make tests use about 2 seconds each
+      maxVisits = (int64_t)round(2.0 * visitsPerSecond/100.0) * 100;
       if(maxVisits < 200) maxVisits = 200;
       if(maxVisits > 10000) maxVisits = 10000;
     }
@@ -839,7 +841,10 @@ int MainCmds::genconfig(int argc, const char* const* argv, const char* firstComm
   out.close();
 
   cout << "You should be now able to run KataGo with this config via something like:" << endl;
-  cout << firstCommand << " gtp -model '" << modelFile << "' -config '" << outputFile << "'" << endl;
+  if(modelFileIsDefault)
+    cout << firstCommand << " gtp -config '" << outputFile << "'" << endl;
+  else
+    cout << firstCommand << " gtp -model '" << modelFile << "' -config '" << outputFile << "'" << endl;
   cout << endl;
 
   cout << "Feel free to look at and edit the above config file further by hand in a txt editor." << endl;

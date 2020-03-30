@@ -1,19 +1,16 @@
-#include "core/global.h"
-#include "core/makedir.h"
-#include "core/config_parser.h"
-#include "core/timer.h"
-#include "core/elo.h"
-#include "dataio/sgf.h"
-#include "search/asyncbot.h"
-#include "program/setup.h"
-#include "program/play.h"
-#include "main.h"
+#include "../core/global.h"
+#include "../core/makedir.h"
+#include "../core/config_parser.h"
+#include "../core/timer.h"
+#include "../core/elo.h"
+#include "../dataio/sgf.h"
+#include "../search/asyncbot.h"
+#include "../program/setup.h"
+#include "../program/play.h"
+#include "../command/commandline.h"
+#include "../main.h"
 
 #include <boost/filesystem.hpp>
-
-#define TCLAP_NAMESTARTSTRING "-" //Use single dashes for all flags
-#include <tclap/CmdLine.h>
-
 #include <csignal>
 
 using namespace std;
@@ -201,12 +198,11 @@ namespace {
     {}
 
     bool getMatchup(
-      NetManager* manager, int64_t& gameIdx, string& forBot, MatchPairer::BotSpec& botSpecB, MatchPairer::BotSpec& botSpecW, Logger& logger
+      NetManager* manager, string& forBot, MatchPairer::BotSpec& botSpecB, MatchPairer::BotSpec& botSpecW, Logger& logger
     )
     {
       std::lock_guard<std::mutex> lock(getMatchupMutex);
 
-      gameIdx = numGamesStartedSoFar;
       numGamesStartedSoFar += 1;
       if(numGamesStartedSoFar % logGamesEvery == 0)
         logger.write("Started " + Global::int64ToString(numGamesStartedSoFar) + " games");
@@ -399,31 +395,36 @@ int MainCmds::matchauto(int argc, const char* const* argv) {
   ScoreValue::initTables();
   Rand seedRand;
 
-  string configFile;
+  ConfigParser cfg;
   string logFile;
   string sgfOutputDir;
   string resultsDir;
   try {
-    TCLAP::CmdLine cmd("Play different nets against each other with different search settings", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> configFileArg("","config-file","Config file to use (see configs/match_example.cfg)",true,string(),"FILE");
+    KataGoCommandLine cmd("Play different nets against each other with different search settings in a match or tournament, experimental.");
+    cmd.addConfigFileArg("","");
+
     TCLAP::ValueArg<string> logFileArg("","log-file","Log file to output to",true,string(),"FILE");
     TCLAP::ValueArg<string> sgfOutputDirArg("","sgf-output-dir","Dir to output sgf files",false,string(),"DIR");
     TCLAP::ValueArg<string> resultsDirArg("","results-dir","Dir to read/write win loss result files",true,string(),"DIR");
-    cmd.add(configFileArg);
     cmd.add(logFileArg);
     cmd.add(sgfOutputDirArg);
     cmd.add(resultsDirArg);
+
+    cmd.setShortUsageArgLimit();
+    cmd.addOverrideConfigArg();
+
     cmd.parse(argc,argv);
-    configFile = configFileArg.getValue();
+
     logFile = logFileArg.getValue();
     sgfOutputDir = sgfOutputDirArg.getValue();
     resultsDir = resultsDirArg.getValue();
-  }
+
+    cmd.getConfig(cfg);
+}
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
   }
-  ConfigParser cfg(configFile);
 
   Logger logger;
   logger.addFile(logFile);
@@ -459,8 +460,7 @@ int MainCmds::matchauto(int argc, const char* const* argv) {
 
   //Load match runner settings
   int numGameThreads = cfg.getInt("numGameThreads",1,16384);
-
-  string searchRandSeedBase = Global::uint64ToHexString(seedRand.nextUInt64());
+  const string gameSeedBase = Global::uint64ToHexString(seedRand.nextUInt64());
 
   //Work out an upper bound on how many concurrent nneval requests we could end up making.
   int maxConcurrentEvals;
@@ -485,11 +485,8 @@ int MainCmds::matchauto(int argc, const char* const* argv) {
   AutoMatchPairer * autoMatchPairer = new AutoMatchPairer(cfg,resultsDir,numBots,botNames,nnModelFilesByBot,paramss);
 
   //Initialize object for randomizing game settings and running games
-  FancyModes fancyModes;
-  fancyModes.allowResignation = cfg.getBool("allowResignation");
-  fancyModes.resignThreshold = cfg.getDouble("resignThreshold",-1.0,0.0); //Threshold on [-1,1], regardless of winLossUtilityFactor
-  fancyModes.resignConsecTurns = cfg.getInt("resignConsecTurns",1,100);
-  GameRunner* gameRunner = new GameRunner(cfg, searchRandSeedBase, fancyModes, logger);
+  PlaySettings playSettings = PlaySettings::loadForMatch(cfg);
+  GameRunner* gameRunner = new GameRunner(cfg, playSettings, logger);
 
 
   //Done loading!
@@ -511,26 +508,27 @@ int MainCmds::matchauto(int argc, const char* const* argv) {
   ofstream* resultOut = new ofstream(resultsDir + "/" + Global::uint64ToHexString(seedRand.nextUInt64()) + ".results.csv");
 
   auto runMatchLoop = [
-    &gameRunner,&autoMatchPairer,&sgfOutputDir,&logger,&resultLock,&resultOut,&manager
+    &gameRunner,&autoMatchPairer,&sgfOutputDir,&logger,&resultLock,&resultOut,&manager,&gameSeedBase
   ](
     uint64_t threadHash
   ) {
     ofstream* sgfOut = sgfOutputDir.length() > 0 ? (new ofstream(sgfOutputDir + "/" + Global::uint64ToHexString(threadHash) + ".sgfs")) : NULL;
     vector<std::atomic<bool>*> stopConditions = {&sigReceived};
 
+    Rand thisLoopSeedRand;
     while(true) {
       if(sigReceived.load())
         break;
 
       FinishedGameData* gameData = NULL;
 
-      int64_t gameIdx;
       string forBot;
       MatchPairer::BotSpec botSpecB;
       MatchPairer::BotSpec botSpecW;
-      if(autoMatchPairer->getMatchup(manager, gameIdx, forBot, botSpecB, botSpecW, logger)) {
+      if(autoMatchPairer->getMatchup(manager, forBot, botSpecB, botSpecW, logger)) {
+        string seed = gameSeedBase + ":" + Global::uint64ToHexString(thisLoopSeedRand.nextUInt64());
         gameData = gameRunner->runGame(
-          gameIdx, botSpecB, botSpecW, NULL, logger,
+          seed, botSpecB, botSpecW, NULL, logger,
           stopConditions, NULL
         );
       }
@@ -541,7 +539,7 @@ int MainCmds::matchauto(int argc, const char* const* argv) {
       bool shouldContinue = gameData != NULL;
       if(gameData != NULL) {
         if(sgfOut != NULL) {
-          WriteSgf::writeSgf(*sgfOut,gameData->bName,gameData->wName,gameData->endHist,gameData);
+          WriteSgf::writeSgf(*sgfOut,gameData->bName,gameData->wName,gameData->endHist,gameData,false);
           (*sgfOut) << endl;
         }
 

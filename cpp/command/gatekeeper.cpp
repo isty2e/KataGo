@@ -1,21 +1,19 @@
-#include "core/global.h"
-#include "core/datetime.h"
-#include "core/makedir.h"
-#include "core/config_parser.h"
-#include "core/timer.h"
-#include "core/threadsafequeue.h"
-#include "dataio/sgf.h"
-#include "dataio/trainingwrite.h"
-#include "dataio/loadmodel.h"
-#include "search/asyncbot.h"
-#include "program/setup.h"
-#include "program/play.h"
-#include "main.h"
+#include "../core/global.h"
+#include "../core/datetime.h"
+#include "../core/makedir.h"
+#include "../core/config_parser.h"
+#include "../core/timer.h"
+#include "../core/threadsafequeue.h"
+#include "../dataio/sgf.h"
+#include "../dataio/trainingwrite.h"
+#include "../dataio/loadmodel.h"
+#include "../search/asyncbot.h"
+#include "../program/setup.h"
+#include "../program/play.h"
+#include "../command/commandline.h"
+#include "../main.h"
 
 #include <sstream>
-
-#define TCLAP_NAMESTARTSTRING "-" //Use single dashes for all flags
-#include <tclap/CmdLine.h>
 
 #include <cstdio>
 #include <chrono>
@@ -152,7 +150,7 @@ namespace {
 
         if(sgfOut != NULL) {
           assert(data->startHist.moveHistory.size() <= data->endHist.moveHistory.size());
-          WriteSgf::writeSgf(*sgfOut,data->bName,data->wName,data->endHist,data);
+          WriteSgf::writeSgf(*sgfOut,data->bName,data->wName,data->endHist,data,false);
           (*sgfOut) << endl;
         }
         delete data;
@@ -211,7 +209,7 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
   ScoreValue::initTables();
   Rand seedRand;
 
-  string configFile;
+  ConfigParser cfg;
   string testModelsDir;
   string acceptedModelsDir;
   string rejectedModelsDir;
@@ -219,23 +217,24 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
   bool noAutoRejectOldModels;
   bool quitIfNoNetsToTest;
   try {
-    TCLAP::CmdLine cmd("Test neural nets to see if they should be accepted", ' ', Version::getKataGoVersionForHelp(),true);
-    TCLAP::ValueArg<string> configFileArg("","config-file","Config file to use",true,string(),"FILE");
+    KataGoCommandLine cmd("Test neural nets to see if they should be accepted for self-play training data generation.");
+    cmd.addConfigFileArg("","");
+
     TCLAP::ValueArg<string> testModelsDirArg("","test-models-dir","Dir to poll and load models from",true,string(),"DIR");
     TCLAP::ValueArg<string> sgfOutputDirArg("","sgf-output-dir","Dir to output sgf files",true,string(),"DIR");
     TCLAP::ValueArg<string> acceptedModelsDirArg("","accepted-models-dir","Dir to write good models to",true,string(),"DIR");
     TCLAP::ValueArg<string> rejectedModelsDirArg("","rejected-models-dir","Dir to write bad models to",true,string(),"DIR");
     TCLAP::SwitchArg noAutoRejectOldModelsArg("","no-autoreject-old-models","Test older models than the latest accepted model");
     TCLAP::SwitchArg quitIfNoNetsToTestArg("","quit-if-no-nets-to-test","Terminate instead of waiting for a new net to test");
-    cmd.add(configFileArg);
     cmd.add(testModelsDirArg);
     cmd.add(sgfOutputDirArg);
     cmd.add(acceptedModelsDirArg);
     cmd.add(rejectedModelsDirArg);
+    cmd.setShortUsageArgLimit();
     cmd.add(noAutoRejectOldModelsArg);
     cmd.add(quitIfNoNetsToTestArg);
     cmd.parse(argc,argv);
-    configFile = configFileArg.getValue();
+
     testModelsDir = testModelsDirArg.getValue();
     sgfOutputDir = sgfOutputDirArg.getValue();
     acceptedModelsDir = acceptedModelsDirArg.getValue();
@@ -251,12 +250,13 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
     checkDirNonEmpty("sgf-output-dir",sgfOutputDir);
     checkDirNonEmpty("accepted-models-dir",acceptedModelsDir);
     checkDirNonEmpty("rejected-models-dir",rejectedModelsDir);
+
+    cmd.getConfig(cfg);
   }
   catch (TCLAP::ArgException &e) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
   }
-  ConfigParser cfg(configFile);
 
   MakeDir::make(testModelsDir);
   MakeDir::make(acceptedModelsDir);
@@ -274,15 +274,10 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
 
   //Load runner settings
   const int numGameThreads = cfg.getInt("numGameThreads",1,16384);
-  const string searchRandSeedBase = Global::uint64ToHexString(seedRand.nextUInt64());
+  const string gameSeedBase = Global::uint64ToHexString(seedRand.nextUInt64());
 
-  FancyModes fancyModes;
-  fancyModes.allowResignation = cfg.getBool("allowResignation");
-  fancyModes.resignThreshold = cfg.getDouble("resignThreshold",-1.0,0.0); //Threshold on [-1,1], regardless of winLossUtilityFactor
-  fancyModes.resignConsecTurns = cfg.getInt("resignConsecTurns",1,100);
-  fancyModes.compensateKomiVisits = cfg.contains("compensateKomiVisits") ? cfg.getInt("compensateKomiVisits",1,10000) : 100;
-
-  GameRunner* gameRunner = new GameRunner(cfg, searchRandSeedBase, fancyModes, logger);
+  PlaySettings playSettings = PlaySettings::loadForGatekeeper(cfg);
+  GameRunner* gameRunner = new GameRunner(cfg, playSettings, logger);
 
   Setup::initializeSession(cfg);
 
@@ -390,7 +385,9 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
   auto gameLoop = [
     &gameRunner,
     &logger,
-    &netAndStuffMutex,&netAndStuff
+    &netAndStuffMutex,
+    &netAndStuff,
+    &gameSeedBase
   ](int threadIdx) {
     std::unique_lock<std::mutex> lock(netAndStuffMutex);
     netAndStuff->registerGameThread();
@@ -398,6 +395,7 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
 
     vector<std::atomic<bool>*> stopConditions = {&shouldStop,&(netAndStuff->terminated)};
 
+    Rand thisLoopSeedRand;
     while(true) {
       if(shouldStop.load() || netAndStuff->terminated.load())
         break;
@@ -406,12 +404,12 @@ int MainCmds::gatekeeper(int argc, const char* const* argv) {
 
       FinishedGameData* gameData = NULL;
 
-      int64_t gameIdx;
       MatchPairer::BotSpec botSpecB;
       MatchPairer::BotSpec botSpecW;
-      if(netAndStuff->matchPairer->getMatchup(gameIdx, botSpecB, botSpecW, logger)) {
+      if(netAndStuff->matchPairer->getMatchup(botSpecB, botSpecW, logger)) {
+        string seed = gameSeedBase + ":" + Global::uint64ToHexString(thisLoopSeedRand.nextUInt64());
         gameData = gameRunner->runGame(
-          gameIdx, botSpecB, botSpecW, NULL, logger,
+          seed, botSpecB, botSpecW, NULL, logger,
           stopConditions, NULL
         );
       }
