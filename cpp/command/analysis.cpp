@@ -16,6 +16,7 @@ using json = nlohmann::json;
 struct AnalyzeRequest {
   string id;
   int turnNumber;
+  int priority;
 
   Board board;
   BoardHistory hist;
@@ -36,6 +37,7 @@ int MainCmds::analysis(int argc, const char* const* argv) {
   ConfigParser cfg;
   string modelFile;
   int numAnalysisThreads;
+
   try {
     KataGoCommandLine cmd("Run KataGo parallel JSON-based analysis engine.");
     cmd.addConfigFileArg("","analysis_example.cfg");
@@ -108,18 +110,22 @@ int MainCmds::analysis(int argc, const char* const* argv) {
     }
   };
 
-  ThreadSafeQueue<AnalyzeRequest*> toAnalyzeQueue;
+  auto pushToWrite = [&toWriteQueue](string* s) {
+    bool suc = toWriteQueue.forcePush(s);
+    if(!suc)
+      delete s;
+  };
 
-  auto analysisLoop = [&params,&nnEval,&logger,perspective,&toAnalyzeQueue,&toWriteQueue,&preventEncore]() {
-    Rand threadRand;
-    string searchRandSeed = Global::uint64ToHexString(threadRand.nextUInt64());
-    AsyncBot* bot = new AsyncBot(params, nnEval, &logger, searchRandSeed);
+  ThreadSafePriorityQueue<std::pair<int,int64_t>, AnalyzeRequest*> toAnalyzeQueue;
+  int64_t numRequestsSoFar = 0; // used as tie breaker for requests with same priority
 
+  auto analysisLoop = [&params,perspective,&toAnalyzeQueue,&toWriteQueue,&preventEncore,&pushToWrite](AsyncBot* bot) {
     while(true) {
-      AnalyzeRequest* request;
-      bool suc = toAnalyzeQueue.waitPop(request);
+      std::pair<std::pair<int,int64_t>,AnalyzeRequest*> analysisItem;
+      bool suc = toAnalyzeQueue.waitPop(analysisItem);
       if(!suc)
         break;
+      AnalyzeRequest* request = analysisItem.second;
 
       SearchParams thisParams = params;
       thisParams.maxVisits = request->maxVisits;
@@ -204,42 +210,45 @@ int MainCmds::analysis(int argc, const char* const* argv) {
         }
         ret["ownership"] = ownerships;
       }
-      toWriteQueue.forcePush(new string(ret.dump()));
+      pushToWrite(new string(ret.dump()));
 
       //Free up bot resources in case it's a while before we do more search
       bot->clearSearch();
       delete request;
     }
-    delete bot;
   };
 
   vector<std::thread> threads;
+  vector<AsyncBot*> bots;
   threads.push_back(std::thread(writeLoop));
   for(int i = 0; i<numAnalysisThreads; i++) {
-    threads.push_back(std::thread(analysisLoop));
+    string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
+    AsyncBot* bot = new AsyncBot(params, nnEval, &logger, searchRandSeed);
+    threads.push_back(std::thread(analysisLoop,bot));
+    bots.push_back(bot);
   }
 
   logger.write("Analyzing up to " + Global::intToString(numAnalysisThreads) + " positions at at time in parallel");
   logger.write("Started, ready to begin handling requests");
 
-  auto reportError = [&toWriteQueue](const string& s) {
+  auto reportError = [&pushToWrite](const string& s) {
     json ret;
     ret["error"] = s;
-    toWriteQueue.forcePush(new string(ret.dump()));
+    pushToWrite(new string(ret.dump()));
   };
-  auto reportErrorForId = [&toWriteQueue](const string& id, const string& field, const string& s) {
+  auto reportErrorForId = [&pushToWrite](const string& id, const string& field, const string& s) {
     json ret;
     ret["id"] = id;
     ret["field"] = field;
     ret["error"] = s;
-    toWriteQueue.forcePush(new string(ret.dump()));
+    pushToWrite(new string(ret.dump()));
   };
-  auto reportWarningForId = [&toWriteQueue](const string& id, const string& field, const string& s) {
+  auto reportWarningForId = [&pushToWrite](const string& id, const string& field, const string& s) {
     json ret;
     ret["id"] = id;
     ret["field"] = field;
     ret["warning"] = s;
-    toWriteQueue.forcePush(new string(ret.dump()));
+    pushToWrite(new string(ret.dump()));
   };
 
   string line;
@@ -276,6 +285,7 @@ int MainCmds::analysis(int argc, const char* const* argv) {
     rbase.rootFpuReductionMax = params.rootFpuReductionMax;
     rbase.rootPolicyTemperature = params.rootPolicyTemperature;
     rbase.includeOwnership = false;
+    rbase.priority = 0;
 
     auto parseInteger = [&input,&rbase,&reportErrorForId](const char* field, int64_t& buf, int64_t min, int64_t max, const char* errorMessage) {
       try {
@@ -523,7 +533,7 @@ int MainCmds::analysis(int argc, const char* const* argv) {
 
     if(input.find("analysisPVLen") != input.end()) {
       int64_t buf;
-      bool suc = parseInteger("analysisPVLen", buf, 1, 100, "Must be an integer from 1 to 100");
+      bool suc = parseInteger("analysisPVLen", buf, 1, 1000, "Must be an integer from 1 to 1000");
       if(!suc)
         continue;
       rbase.analysisPVLen = (int)buf;
@@ -543,6 +553,13 @@ int MainCmds::analysis(int argc, const char* const* argv) {
       bool suc = parseBoolean("includeOwnership", rbase.includeOwnership, "Must be a boolean");
       if(!suc)
         continue;
+    }
+    if(input.find("priority") != input.end()) {
+      int64_t buf;
+      bool suc = parseInteger("priority", buf, -0x7FFFFFFF,0x7FFFFFFF, "Must be a number from -2,147,483,647 to 2,147,483,647");
+      if(!suc)
+        continue;
+      rbase.priority = (int)buf;
     }
 
     Board board(boardXSize,boardYSize);
@@ -586,6 +603,7 @@ int MainCmds::analysis(int argc, const char* const* argv) {
         newRequest->rootFpuReductionMax = rbase.rootFpuReductionMax;
         newRequest->rootPolicyTemperature = rbase.rootPolicyTemperature;
         newRequest->includeOwnership = rbase.includeOwnership;
+        newRequest->priority = rbase.priority;
         newRequests.push_back(newRequest);
       }
       if(turnNumber >= moveHistory.size())
@@ -614,15 +632,29 @@ int MainCmds::analysis(int argc, const char* const* argv) {
       continue;
     }
 
-    for(int i = 0; i<newRequests.size(); i++)
-      toAnalyzeQueue.forcePush(newRequests[i]);
+    for(int i = 0; i<newRequests.size(); i++) {
+      //Compare first by user-provided priority, and next breaks ties by preferring earlier requests.
+      std::pair<int,int64_t> priorityKey = std::make_pair(newRequests[i]->priority, -numRequestsSoFar);
+      bool suc = toAnalyzeQueue.forcePush( std::make_pair(priorityKey, newRequests[i]) );
+      assert(suc);
+      (void)suc;
+      numRequestsSoFar++;
+    }
     newRequests.clear();
   }
 
+  //Making toWriteQueue readOnly will immediately halt futher output and signal the write loop thread to terminate.
   toWriteQueue.setReadOnly();
+  //Making these readOnly should signal the analysis loop threads to terminate.
   toAnalyzeQueue.setReadOnly();
+  //Interrupt any searches going on to help the analysis threads realize to terminate faster.
+  for(int i = 0; i<bots.size(); i++)
+    bots[i]->stopWithoutWait();
+
   for(int i = 0; i<threads.size(); i++)
     threads[i].join();
+  for(int i = 0; i<bots.size(); i++)
+    delete bots[i];
 
   logger.write(nnEval->getModelFileName());
   logger.write("NN rows: " + Global::int64ToString(nnEval->numRowsProcessed()));
