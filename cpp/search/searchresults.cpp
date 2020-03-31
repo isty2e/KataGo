@@ -306,10 +306,7 @@ ReportedSearchValues Search::getRootRawNNValuesRequireSuccess() const {
 }
 
 bool Search::getNodeRawNNValues(const SearchNode& node, ReportedSearchValues& values) const {
-  std::mutex& mutex = mutexPool->getMutex(node.lockIdx);
-  unique_lock<std::mutex> lock(mutex);
-  shared_ptr<NNOutput> nnOutput = node.nnOutput;
-  lock.unlock();
+  const NNOutput* nnOutput = node.getNNOutput();
   if(nnOutput == nullptr)
     return false;
 
