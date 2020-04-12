@@ -216,7 +216,8 @@ static bool shouldResign(
   const vector<double>& recentWinLossValues,
   double lead,
   const double resignThreshold,
-  const int resignConsecTurns
+  const int resignConsecTurns,
+  const double resignMinScoreDifference
 ) {
   double initialBlackAdvantageInPoints = initialBlackAdvantage(hist);
 
@@ -249,6 +250,9 @@ static bool shouldResign(
   if(pla == P_WHITE && lead > noResignationWhenWhiteScoreAbove)
     return false;
   if(resignConsecTurns > recentWinLossValues.size())
+    return false;
+  //Don't resign close games.
+  if((pla == P_WHITE && lead > -resignMinScoreDifference) || (pla == P_BLACK && lead < resignMinScoreDifference))
     return false;
 
   for(int i = 0; i<resignConsecTurns; i++) {
@@ -675,7 +679,7 @@ struct GTPEngine {
     Player pla,
     Logger& logger, double searchFactorWhenWinningThreshold, double searchFactorWhenWinning,
     bool cleanupBeforePass, bool ogsChatToStderr,
-    bool allowResignation, double resignThreshold, int resignConsecTurns,
+    bool allowResignation, double resignThreshold, int resignConsecTurns, double resignMinScoreDifference,
     bool logSearchInfo, bool debug, bool playChosenMove,
     string& response, bool& responseIsError, bool& maybeStartPondering,
     AnalyzeArgs args
@@ -811,7 +815,7 @@ struct GTPEngine {
 
     bool resigned = allowResignation && shouldResign(
       bot->getRootBoard(),bot->getRootHist(),pla,recentWinLossValues,lead,
-      resignThreshold,resignConsecTurns
+      resignThreshold,resignConsecTurns,resignMinScoreDifference
     );
 
     if(resigned)
@@ -1243,6 +1247,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
   const bool allowResignation = cfg.contains("allowResignation") ? cfg.getBool("allowResignation") : false;
   const double resignThreshold = cfg.contains("allowResignation") ? cfg.getDouble("resignThreshold",-1.0,0.0) : -1.0; //Threshold on [-1,1], regardless of winLossUtilityFactor
   const int resignConsecTurns = cfg.contains("resignConsecTurns") ? cfg.getInt("resignConsecTurns",1,100) : 3;
+  const double resignMinScoreDifference = cfg.contains("resignMinScoreDifference") ? cfg.getDouble("resignMinScoreDifference",0.0,1000.0) : -1e10;
 
   Setup::initializeSession(cfg);
 
@@ -1862,7 +1867,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
           pla,
           logger,searchFactorWhenWinningThreshold,searchFactorWhenWinning,
           cleanupBeforePass,ogsChatToStderr,
-          allowResignation,resignThreshold,resignConsecTurns,
+          allowResignation,resignThreshold,resignConsecTurns,resignMinScoreDifference,
           logSearchInfo,debug,playChosenMove,
           response,responseIsError,maybeStartPondering,
           GTPEngine::AnalyzeArgs()
@@ -1891,7 +1896,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
           pla,
           logger,searchFactorWhenWinningThreshold,searchFactorWhenWinning,
           cleanupBeforePass,ogsChatToStderr,
-          allowResignation,resignThreshold,resignConsecTurns,
+          allowResignation,resignThreshold,resignConsecTurns,resignMinScoreDifference,
           logSearchInfo,debug,playChosenMove,
           response,responseIsError,maybeStartPondering,
           args
