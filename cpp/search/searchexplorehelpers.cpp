@@ -98,7 +98,7 @@ double Search::getExploreSelectionValueOfChild(
   (void)parentUtility;
   int movePos = getPos(moveLoc);
   float nnPolicyProb = parentPolicyProbs[movePos];
-  if(searchParams.policyBiasFactor > 0) {
+  if(searchParams.policyBiasFactor > 0 && nnPolicyProb > 0) {
     nnPolicyProb = parent.policyBiasHandle.getUpdatedPolicyProb(nnPolicyProb, movePos, searchParams.policyBiasFactor, searchParams.policyBiasDiscountSelf);
   }
 
@@ -150,7 +150,7 @@ double Search::getExploreSelectionValueOfChild(
     }
     //Hack to get the root to funnel more visits down child branches
     if(searchParams.rootDesiredPerChildVisitsCoeff > 0.0) {
-      if(childWeight < sqrt(nnPolicyProb * totalChildWeight * searchParams.rootDesiredPerChildVisitsCoeff)) {
+      if(nnPolicyProb > 0 && childWeight < sqrt(nnPolicyProb * totalChildWeight * searchParams.rootDesiredPerChildVisitsCoeff)) {
         return 1e20;
       }
     }
@@ -170,11 +170,11 @@ double Search::getExploreSelectionValueOfChild(
       }
     }
 
-    if(searchParams.wideRootNoise > 0.0) {
+    if(searchParams.wideRootNoise > 0.0 && nnPolicyProb >= 0) {
       maybeApplyWideRootNoise(childUtility, nnPolicyProb, searchParams, thread, parent);
     }
   }
-  if(isDuringSearch && antiMirror) {
+  if(isDuringSearch && antiMirror && nnPolicyProb >= 0) {
     maybeApplyAntiMirrorPolicy(nnPolicyProb, moveLoc, parentPolicyProbs, parent.nextPla, thread);
     maybeApplyAntiMirrorForcedExplore(childUtility, parentUtility, moveLoc, parentPolicyProbs, childWeight, totalChildWeight, parent.nextPla, thread, parent);
   }
@@ -332,6 +332,8 @@ void Search::selectBestChildToDescend(
     Loc moveLoc = children[i].getMoveLocRelaxed();
     int movePos = getPos(moveLoc);
     float nnPolicyProb = policyProbs[movePos];
+    if(nnPolicyProb < 0)
+      continue;
     policyProbMassVisited += nnPolicyProb;
 
     int64_t edgeVisits = children[i].getEdgeVisits();
@@ -422,7 +424,11 @@ void Search::selectBestChildToDescend(
         continue;
     }
 
+    //Quit immediately for illegal moves
     float nnPolicyProb = policyProbs[movePos];
+    if(nnPolicyProb < 0)
+      continue;
+
     if(searchParams.policyBiasFactor > 0) {
       nnPolicyProb = node.policyBiasHandle.getUpdatedPolicyProb(nnPolicyProb, movePos, searchParams.policyBiasFactor, searchParams.policyBiasDiscountSelf);
     }
