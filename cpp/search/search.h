@@ -33,6 +33,7 @@ struct MoreNodeStats;
 struct ReportedSearchValues;
 struct SearchChildPointer;
 struct SubtreeValueBiasTable;
+struct PolicyBiasTable;
 struct SearchNodeTable;
 
 //Per-thread state
@@ -148,6 +149,7 @@ struct Search {
   SearchNodeTable* nodeTable;
   MutexPool* mutexPool;
   SubtreeValueBiasTable* subtreeValueBiasTable;
+  PolicyBiasTable* policyBiasTable;
 
   //Thread pool
   int numThreadsSpawned;
@@ -504,32 +506,45 @@ private:
   // Move selection during search
   // searchexplorehelpers.cpp
   //----------------------------------------------------------------------------------------
+  double getExploreScaling(
+    double totalChildWeight, double parentUtilityStdevFactor
+  ) const;
   double getExploreSelectionValue(
-    double nnPolicyProb, double totalChildWeight, double childWeight,
-    double childUtility, double parentUtilityStdevFactor, Player pla
+    double exploreScaling,
+    double nnPolicyProb,
+    double childWeight,
+    double childUtility,
+    Player pla
   ) const;
   double getExploreSelectionValueInverse(
-    double exploreSelectionValue, double nnPolicyProb, double totalChildWeight,
-    double childUtility, double parentUtilityStdevFactor, Player pla
+    double exploreScaling,
+    double exploreSelectionValue,
+    double nnPolicyProb,
+    double childUtility,
+    Player pla
   ) const;
   double getExploreSelectionValueOfChild(
     const SearchNode& parent, const float* parentPolicyProbs, const SearchNode* child,
     Loc moveLoc,
+    double exploreScaling,
     double totalChildWeight, int64_t childEdgeVisits, double fpuValue,
-    double parentUtility, double parentWeightPerVisit, double parentUtilityStdevFactor,
+    double parentUtility, double parentWeightPerVisit,
     bool isDuringSearch, bool antiMirror, double maxChildWeight, SearchThread* thread
   ) const;
   double getNewExploreSelectionValue(
-    const SearchNode& parent, float nnPolicyProb,
-    double totalChildWeight, double fpuValue,
-    double parentWeightPerVisit, double parentUtilityStdevFactor,
+    const SearchNode& parent,
+    double exploreScaling,
+    float nnPolicyProb,
+    double fpuValue,
+    double parentWeightPerVisit,
     double maxChildWeight, SearchThread* thread
   ) const;
   double getReducedPlaySelectionWeight(
     const SearchNode& parent, const float* parentPolicyProbs, const SearchNode* child,
     Loc moveLoc,
-    double totalChildWeight, int64_t childEdgeVisits,
-    double parentUtilityStdevFactor, double bestChildExploreSelectionValue
+    double exploreScaling,
+    int64_t childEdgeVisits,
+    double bestChildExploreSelectionValue
   ) const;
 
   double getFpuValueForChildrenAssumeVisited(
@@ -578,6 +593,8 @@ private:
 
   double pruneNoiseWeight(std::vector<MoreNodeStats>& statsBuf, int numChildren, double totalChildWeight, const double* policyProbsBuf) const;
 
+  void updatePolicyBias(SearchNode& node, int childrenCapacity, SearchChildPointer* children);
+
   //----------------------------------------------------------------------------------------
   // Allocation, search clearing and garbage collection
   // search.cpp
@@ -586,7 +603,6 @@ private:
   SearchNode* allocateOrFindNode(SearchThread& thread, Player nextPla, Loc bestChildMoveLoc, bool forceNonTerminal, Hash128 graphHash);
   void clearOldNNOutputs();
   void transferOldNNOutputs(SearchThread& thread);
-  void removeSubtreeValueBias(SearchNode* node);
   void deleteAllOldOrAllNewTableNodesAndSubtreeValueBiasMulithreaded(bool old);
   void deleteAllTableNodesMulithreaded();
 

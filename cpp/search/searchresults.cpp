@@ -136,14 +136,17 @@ bool Search::getPlaySelectionValues(
 
     bool isDuringSearch = false;
 
+    double exploreScaling = getExploreScaling(totalChildWeight, parentUtilityStdevFactor);
+
     const NNOutput* nnOutput = node.getNNOutput();
     assert(nnOutput != NULL);
     const float* policyProbs = nnOutput->getPolicyProbsMaybeNoised();
     double bestChildExploreSelectionValue = getExploreSelectionValueOfChild(
       node,policyProbs,bestChild,
       bestMoveLoc,
+      exploreScaling,
       totalChildWeight,bestChildEdgeVisits,fpuValue,
-      parentUtility,parentWeightPerVisit,parentUtilityStdevFactor,
+      parentUtility,parentWeightPerVisit,
       isDuringSearch,false,maxChildWeight,NULL
     );
 
@@ -159,8 +162,9 @@ bool Search::getPlaySelectionValues(
         double reduced = getReducedPlaySelectionWeight(
           node, policyProbs, child,
           moveLoc,
-          totalChildWeight, edgeVisits,
-          parentUtilityStdevFactor, bestChildExploreSelectionValue
+          exploreScaling,
+          edgeVisits,
+          bestChildExploreSelectionValue
         );
         playSelectionValues[i] = ceil(reduced);
       }
@@ -851,7 +855,7 @@ void Search::getAnalysisData(
   double policyProbMassVisited = 0.0;
   {
     for(int i = 0; i<numChildren; i++) {
-      policyProbMassVisited += policyProbs[getPos(childrenMoveLocs[i])];
+      policyProbMassVisited += std::max(0.0, (double)policyProbs[getPos(childrenMoveLocs[i])]);
     }
     //Probability mass should not sum to more than 1, giving a generous allowance
     //for floating point error.

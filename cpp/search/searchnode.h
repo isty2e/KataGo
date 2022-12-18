@@ -7,6 +7,7 @@
 #include "../game/boardhistory.h"
 #include "../neuralnet/nneval.h"
 #include "../search/subtreevaluebiastable.h"
+#include "../search/policybiastable.h"
 
 struct SearchNode;
 struct SearchThread;
@@ -182,13 +183,8 @@ struct SearchNode {
   NodeStatsAtomic stats;
   std::atomic<int32_t> virtualLosses;
 
-  //Protected under the entryLock in subtreeValueBiasTableEntry
-  //Used only if subtreeValueBiasTableEntry is not nullptr.
-  //During search, subtreeValueBiasTableEntry itself is set upon creation of the node and remains constant
-  //thereafter, making it safe to access without synchronization.
-  double lastSubtreeValueBiasDeltaSum;
-  double lastSubtreeValueBiasWeight;
-  std::shared_ptr<SubtreeValueBiasEntry> subtreeValueBiasTableEntry;
+  SubtreeValueBiasHandle subtreeValueBiasTableHandle;
+  PolicyBiasHandle policyBiasHandle;
 
   std::atomic<int32_t> dirtyCounter;
 

@@ -164,9 +164,8 @@ SearchNode::SearchNode(Player pla, bool fnt, uint32_t mIdx)
    children2(NULL),
    stats(),
    virtualLosses(0),
-   lastSubtreeValueBiasDeltaSum(0.0),
-   lastSubtreeValueBiasWeight(0.0),
-   subtreeValueBiasTableEntry(),
+   subtreeValueBiasTableHandle(),
+   policyBiasHandle(),
    dirtyCounter(0)
 {
 }
@@ -184,9 +183,8 @@ SearchNode::SearchNode(const SearchNode& other, bool fnt, bool copySubtreeValueB
    children2(NULL),
    stats(other.stats),
    virtualLosses(other.virtualLosses.load(std::memory_order_acquire)),
-   lastSubtreeValueBiasDeltaSum(0.0),
-   lastSubtreeValueBiasWeight(0.0),
-   subtreeValueBiasTableEntry(),
+   subtreeValueBiasTableHandle(),
+   policyBiasHandle(),
    dirtyCounter(other.dirtyCounter.load(std::memory_order_acquire))
 {
   if(other.children0 != NULL) {
@@ -211,6 +209,7 @@ SearchNode::SearchNode(const SearchNode& other, bool fnt, bool copySubtreeValueB
     //lastSubtreeValueBiasDeltaSum = other.lastSubtreeValueBiasDeltaSum;
     //lastSubtreeValueBiasWeight = other.lastSubtreeValueBiasWeight;
     //subtreeValueBiasTableEntry = other.subtreeValueBiasTableEntry;
+    //policyBiasHandle = other.policyBiasHandle;
   }
 }
 

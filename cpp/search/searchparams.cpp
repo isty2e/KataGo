@@ -70,6 +70,8 @@ SearchParams::SearchParams()
    subtreeValueBiasTableNumShards(65536),
    subtreeValueBiasFreeProp(0.8),
    subtreeValueBiasWeightExponent(0.5),
+   policyBiasFactor(0.0),
+   policyBiasDiscountSelf(true),
    nodeTableShardsPowerOfTwo(16),
    numVirtualLossesPerThread(3.0),
    numThreads(1),
@@ -150,6 +152,8 @@ SearchParams SearchParams::forTestsV2() {
   params.subtreeValueBiasFactor = 0.45;
   params.subtreeValueBiasFreeProp = 0.8;
   params.subtreeValueBiasWeightExponent = 0.85;
+  params.policyBiasFactor = 0.0;
+  params.policyBiasDiscountSelf = true;
   return params;
 }
 
@@ -255,6 +259,8 @@ void SearchParams::printParams(std::ostream& out) {
   PRINTPARAM(subtreeValueBiasFreeProp);
   PRINTPARAM(subtreeValueBiasWeightExponent);
 
+  PRINTPARAM(policyBiasFactor);
+  PRINTPARAM(policyBiasDiscountSelf);
 
   PRINTPARAM(nodeTableShardsPowerOfTwo);
   PRINTPARAM(numVirtualLossesPerThread);

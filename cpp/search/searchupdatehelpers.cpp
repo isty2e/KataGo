@@ -24,16 +24,10 @@ void Search::addLeafValue(
     getResultUtility(winLossValue, noResultValue)
     + getScoreUtility(scoreMean, scoreMeanSq);
 
-  if(searchParams.subtreeValueBiasFactor != 0 && !isTerminal && node.subtreeValueBiasTableEntry != nullptr) {
-    SubtreeValueBiasEntry& entry = *(node.subtreeValueBiasTableEntry);
-    while(entry.entryLock.test_and_set(std::memory_order_acquire));
-    double newEntryDeltaUtilitySum = entry.deltaUtilitySum;
-    double newEntryWeightSum = entry.weightSum;
-    entry.entryLock.clear(std::memory_order_release);
+  if(searchParams.subtreeValueBiasFactor != 0 && !isTerminal && node.subtreeValueBiasTableHandle.entry != nullptr) {
     //This is the amount of the direct evaluation of this node that we are going to bias towards the table entry
     const double biasFactor = searchParams.subtreeValueBiasFactor;
-    if(newEntryWeightSum > 0.001)
-      utility += biasFactor * newEntryDeltaUtilitySum / newEntryWeightSum;
+    utility += biasFactor * node.subtreeValueBiasTableHandle.getValue();
   }
 
   utility += getPatternBonus(node.patternBonusHash,getOpp(node.nextPla));
@@ -251,41 +245,19 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
       getResultUtility(winProb-lossProb, noResultProb)
       + getScoreUtility(scoreMean, scoreMeanSq);
 
-    if(searchParams.subtreeValueBiasFactor != 0 && node.subtreeValueBiasTableEntry != nullptr) {
-      SubtreeValueBiasEntry& entry = *(node.subtreeValueBiasTableEntry);
-
-      double newEntryDeltaUtilitySum;
-      double newEntryWeightSum;
-
+    if(searchParams.subtreeValueBiasFactor != 0 && node.subtreeValueBiasTableHandle.entry != nullptr) {
       if(currentTotalChildWeight > 1e-10) {
         double utilityChildren = utilitySum / currentTotalChildWeight;
         double subtreeValueBiasWeight = pow(origTotalChildWeight, searchParams.subtreeValueBiasWeightExponent);
         double subtreeValueBiasDeltaSum = (utilityChildren - utility) * subtreeValueBiasWeight;
 
-        while(entry.entryLock.test_and_set(std::memory_order_acquire));
-        entry.deltaUtilitySum += subtreeValueBiasDeltaSum - node.lastSubtreeValueBiasDeltaSum;
-        entry.weightSum += subtreeValueBiasWeight - node.lastSubtreeValueBiasWeight;
-        newEntryDeltaUtilitySum = entry.deltaUtilitySum;
-        newEntryWeightSum = entry.weightSum;
-        node.lastSubtreeValueBiasDeltaSum = subtreeValueBiasDeltaSum;
-        node.lastSubtreeValueBiasWeight = subtreeValueBiasWeight;
-        entry.entryLock.clear(std::memory_order_release);
+        const double biasFactor = searchParams.subtreeValueBiasFactor;
+        utility += biasFactor * node.subtreeValueBiasTableHandle.updateValue(subtreeValueBiasDeltaSum, subtreeValueBiasWeight);
       }
       else {
-        while(entry.entryLock.test_and_set(std::memory_order_acquire));
-        newEntryDeltaUtilitySum = entry.deltaUtilitySum;
-        newEntryWeightSum = entry.weightSum;
-        entry.entryLock.clear(std::memory_order_release);
+        const double biasFactor = searchParams.subtreeValueBiasFactor;
+        utility += biasFactor * node.subtreeValueBiasTableHandle.getValue();
       }
-
-      //This is the amount of the direct evaluation of this node that we are going to bias towards the table entry
-      const double biasFactor = searchParams.subtreeValueBiasFactor;
-      if(newEntryWeightSum > 0.001)
-        utility += biasFactor * newEntryDeltaUtilitySum / newEntryWeightSum;
-      //This is the amount by which we need to scale desiredSelfWeight such that if the table entry were actually equal to
-      //the current difference between the direct eval and the children, we would perform a no-op... unless a noop is actually impossible
-      //Then we just take what we can get.
-      //desiredSelfWeight *= weightSum / (1.0-biasFactor) / std::max(0.001, (weightSum + desiredSelfWeight - desiredSelfWeight / (1.0-biasFactor)));
     }
 
     double weight = computeWeightFromNNOutput(nnOutput);
@@ -464,4 +436,85 @@ double Search::pruneNoiseWeight(vector<MoreNodeStats>& statsBuf, int numChildren
     rawPolicySumSoFar += rawPolicy;
   }
   return weightSumSoFar;
+}
+
+void Search::updatePolicyBias(SearchNode& node, int childrenCapacity, SearchChildPointer* children) {
+  int childPoses[NNPos::MAX_NN_POLICY_SIZE];
+  float childProbs[NNPos::MAX_NN_POLICY_SIZE];
+  double childWeights[NNPos::MAX_NN_POLICY_SIZE];
+  double childUtilities[NNPos::MAX_NN_POLICY_SIZE];
+
+  NNOutput* nnOutput = node.getNNOutput();
+  assert(nnOutput != NULL);
+  const float* policyProbs = nnOutput->getPolicyProbsMaybeNoised();
+
+  int numChildren = 0;
+  for(int i = 0; i<childrenCapacity; i++) {
+    const SearchNode* child = children[i].getIfAllocated();
+    if(child == NULL)
+      break;
+    Loc moveLoc = children[i].getMoveLocRelaxed();
+    int movePos = getPos(moveLoc);
+    float nnPolicyProb = policyProbs[movePos];
+
+    int64_t edgeVisits = children[i].getEdgeVisits();
+    double childWeight = child->stats.getChildWeight(edgeVisits);
+
+    if(childWeight < 0.001)
+      continue;
+
+    double childUtility = child->stats.utilityAvg.load(std::memory_order_acquire);
+
+    childPoses[numChildren] = movePos;
+    childProbs[numChildren] = nnPolicyProb;
+    childWeights[numChildren] = childWeight;
+    childUtilities[numChildren] = childUtility;
+    numChildren += 1;
+  }
+
+  double totalChildWeight = 0.0;
+  int highestWeightChildIdx = 0;
+  for(int i = 0; i<numChildren; i++) {
+    totalChildWeight += childWeights[i];
+    if(childWeights[i] > childWeights[highestWeightChildIdx])
+      highestWeightChildIdx = i;
+  }
+
+  if(totalChildWeight < 0.001)
+    return;
+
+  // Take any child whose value is at least as great as the highest weight child
+  // and that is at least as surprising.
+  // Subtract a small constant to penalize low-explored things and make sure that
+  // node really has been explored enough.
+  double weightPenalty = 2.0 + childWeights[highestWeightChildIdx] * 0.02;
+
+  int bestChildIdx;
+  double bestChildSurprise;
+  {
+    int i = highestWeightChildIdx;
+    double posterior = (childWeights[i] - weightPenalty) / totalChildWeight;
+    double surprise = posterior / (childProbs[i] + 0.01);
+    bestChildIdx = i;
+    bestChildSurprise = surprise;
+  }
+
+  for(int i = 0; i<numChildren; i++) {
+    if(i != highestWeightChildIdx && childUtilities[i] > childUtilities[highestWeightChildIdx] && childWeights[i] > weightPenalty) {
+      double posterior = (childWeights[i] - weightPenalty) / totalChildWeight;
+      double surprise = posterior / (childProbs[i] + 0.01);
+      if(surprise > bestChildSurprise) {
+        bestChildIdx = i;
+        bestChildSurprise = surprise;
+      }
+    }
+  }
+
+  int bestChildPos = childPoses[bestChildIdx];
+  if(node.policyBiasHandle.entries[bestChildPos] != nullptr) {
+    assert(node.policyBiasHandle.entries.size() > bestChildPos);
+
+    double logSurprise = bestChildSurprise <= 1.0 ? 0.0 : std::max(0.0, log(bestChildSurprise));
+    node.policyBiasHandle.updateValue(logSurprise * totalChildWeight, totalChildWeight, bestChildPos);
+  }
 }
